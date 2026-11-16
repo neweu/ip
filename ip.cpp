@@ -1,3 +1,10 @@
+// Copyright 2026 neweu
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//     http://www.apache.org/licenses/LICENSE-2.0
+// SPDX-License-Identifier: Apache-2.0
+
 #define UNICODE
 #define _UNICODE
 #define _WIN32_WINNT 0x0A00
@@ -282,7 +289,7 @@ static DWORD WINAPI ReverseDnsWorkerThread(LPVOID) {
   } else {
    g_app.ptrWorkerBusy = false;
    LeaveCriticalSection(&g_app.dataLock);
-   break;
+   return 0;
   }
   LeaveCriticalSection(&g_app.dataLock);
 
@@ -294,8 +301,12 @@ static DWORD WINAPI ReverseDnsWorkerThread(LPVOID) {
   if (g_app.dnsCacheMap.find(ip) == g_app.dnsCacheMap.end()) g_app.dnsCacheMap[ip] = dom;
   LeaveCriticalSection(&g_app.dataLock);
 
-  if (g_app.hwnd && !dom.empty()) InvalidateRect(g_app.hwnd, nullptr, FALSE);
+  if (g_app.hwnd && !dom.empty() && InterlockedCompareExchange(&g_app.isShuttingDown, 0, 0) == 0)
+   InvalidateRect(g_app.hwnd, nullptr, FALSE);
  }
+ EnterCriticalSection(&g_app.dataLock);
+ g_app.ptrWorkerBusy = false;
+ LeaveCriticalSection(&g_app.dataLock);
  return 0;
 }
 
@@ -340,6 +351,17 @@ static SOCKET ConnectLoopbackFast(u_short port, int timeoutMs) {
  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to, sizeof(to));
  setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&to, sizeof(to));
  return s;
+}
+
+static bool ShouldProbeLocalPort(u_short port, int activeClients) {
+ if (port < 1024) return false;
+ switch (port) {
+  case 3306: case 3389: case 5037: case 5432: case 5555:
+  case 6379: case 6463: case 8384: case 9222: case 9229: case 27017:
+   return false;
+ }
+ if (port >= 49152 && activeClients == 0) return false;
+ return true;
 }
 
 static LocalProxyProto ProbeLocalPortProtocol(u_short port) {
@@ -534,12 +556,14 @@ static void ParseIpinfoJson(const std::wstring& json, EndpointIpResult& out) {
 
 static EndpointIpResult ProbeDualStackIpinfo(bool viaProxy, u_short port = 0, LocalProxyProto proto = PROXY_PROTO_NONE) {
  EndpointIpResult res; int v4Ms = -1, v6Ms = -1;
+ if (InterlockedCompareExchange(&g_app.isShuttingDown, 0, 0) != 0) return res;
  std::wstring j4 = Utf8ToWide(viaProxy ? FetchHttpsViaLocalProxy(port, proto, L"ipinfo.io", "ipinfo.io", &v4Ms)
                                        : HttpGetDirectOS(L"https://ipinfo.io/json", &v4Ms, 3000));
  std::wstring ip4 = ExtractJsonStr(j4, L"ip");
  if (!ip4.empty()) { res.ipv4 = ip4; res.latencyMs = v4Ms; ParseIpinfoJson(j4, res); }
  else { res.ipv4 = L"Unavailable"; res.location = viaProxy ? L"Proxy Probe Failed" : L"Connection Failed"; res.orgLine = L"--"; }
 
+ if (InterlockedCompareExchange(&g_app.isShuttingDown, 0, 0) != 0) return res;
  std::wstring j6 = Utf8ToWide(viaProxy ? FetchHttpsViaLocalProxy(port, proto, L"v6.ipinfo.io", "v6.ipinfo.io", &v6Ms)
                                        : HttpGetDirectOS(L"https://v6.ipinfo.io/json", &v6Ms, 2000));
  std::wstring ip6 = ExtractJsonStr(j6, L"ip");
@@ -576,21 +600,24 @@ static DWORD WINAPI PublicIpWorkerThread(LPVOID) {
   // Only query system route IP if forced, expired (>5 min), or never succeeded
   bool needSysIp = forceRefresh || lastSysTick == 0 || (nowTick - lastSysTick > 300000) ||
                    sysRes.ipv4 == L"Detecting..." || sysRes.ipv4 == L"Unavailable";
-  if (needSysIp) {
+  if (needSysIp && InterlockedCompareExchange(&g_app.isShuttingDown, 0, 0) == 0) {
    sysRes = ProbeDualStackIpinfo(false);
    lastSysTick = GetTickCount64();
   }
 
-  // Probe unknown local listening ports on 127.0.0.1 (zero external API traffic)
+  // Non-intrusive local listening port protocol verification (cached per PID lifecycle)
   int newProbes = 0;
   for (auto& item : listenList) {
+   if (InterlockedCompareExchange(&g_app.isShuttingDown, 0, 0) != 0) break;
    auto it = portCacheCopy.find(item.port);
-   if (it != portCacheCopy.end() && it->second.pid == item.pid) {
-    bool isVerifiedProxy = (it->second.proto == PROXY_PROTO_SOCKS5 || it->second.proto == PROXY_PROTO_HTTP);
-    if (isVerifiedProxy || (nowTick - it->second.lastProbeTick) < 60000) {
-     item.verifiedProto = it->second.proto;
-     continue;
-    }
+   if (it != portCacheCopy.end() && it->second.pid == item.pid && it->second.proto != PROXY_PROTO_UNKNOWN) {
+    item.verifiedProto = it->second.proto;
+    continue;
+   }
+   if (!ShouldProbeLocalPort(item.port, item.activeClients)) {
+    item.verifiedProto = PROXY_PROTO_NONE;
+    portCacheCopy[item.port] = { item.pid, PROXY_PROTO_NONE, nowTick };
+    continue;
    }
    if (newProbes < 30) {
     item.verifiedProto = ProbeLocalPortProtocol(item.port);
@@ -615,7 +642,7 @@ static DWORD WINAPI PublicIpWorkerThread(LPVOID) {
    return out;
   };
 
-  if (sysPort > 0) {
+  if (sysPort > 0 && InterlockedCompareExchange(&g_app.isShuttingDown, 0, 0) == 0) {
    LocalProxyProto p = ProbeLocalPortProtocol(sysPort);
    if (p == PROXY_PROTO_NONE) p = PROXY_PROTO_HTTP;
    std::wstring pName = L"System Proxy"; DWORD pPid = 0;
@@ -626,6 +653,7 @@ static DWORD WINAPI PublicIpWorkerThread(LPVOID) {
   }
 
   for (const auto& item : listenList) {
+   if (InterlockedCompareExchange(&g_app.isShuttingDown, 0, 0) != 0) break;
    if ((item.verifiedProto == PROXY_PROTO_SOCKS5 || item.verifiedProto == PROXY_PROTO_HTTP) &&
        addedPorts.find(item.port) == addedPorts.end()) {
     VerifiedProxyInstance inst = { item.port, item.pid, item.verifiedProto, item.procName, false, {} };
@@ -634,6 +662,8 @@ static DWORD WINAPI PublicIpWorkerThread(LPVOID) {
     addedPorts.insert(item.port);
    }
   }
+
+  if (InterlockedCompareExchange(&g_app.isShuttingDown, 0, 0) != 0) break;
 
   EnterCriticalSection(&g_app.dataLock);
   g_app.portCache = portCacheCopy;
@@ -645,9 +675,13 @@ static DWORD WINAPI PublicIpWorkerThread(LPVOID) {
   if (!loopAgain) g_app.isCheckingIp = false;
   LeaveCriticalSection(&g_app.dataLock);
 
-  if (g_app.hwnd) PostMessageW(g_app.hwnd, WM_USER_IP_UPDATED, 0, 0);
-  if (!loopAgain) break;
+  if (g_app.hwnd && InterlockedCompareExchange(&g_app.isShuttingDown, 0, 0) == 0)
+   PostMessageW(g_app.hwnd, WM_USER_IP_UPDATED, 0, 0);
+  if (!loopAgain) return 0;
  }
+ EnterCriticalSection(&g_app.dataLock);
+ g_app.isCheckingIp = false;
+ LeaveCriticalSection(&g_app.dataLock);
  return 0;
 }
 
@@ -1232,7 +1266,7 @@ static void RenderUI() {
   const auto& vProxies = g_app.verifiedProxies;
 
   D2D1_RECT_F speedCard = RF(contentX, topY, contentX + col2W, topY + row1H);
-  DrawGlassCard(rt, br, speedCard, L"Network Speed", L"\u21C5");
+  DrawGlassCard(rt, br, speedCard, L"Realtime Throughput", L"\u21C5");
   DrawTxt(rt, br, g_app.tfSpeedVal, L"\u2193 " + FormatBytes(g_app.curDownSpeed, true), RF(speedCard.left + 14, speedCard.top + 38, speedCard.left + 210, speedCard.top + 66), g_pal.textWhite);
   DrawTxt(rt, br, g_app.tfSpeedVal, L"\u2191 " + FormatBytes(g_app.curUpSpeed, true), RF(speedCard.right - 210, speedCard.top + 38, speedCard.right - 14, speedCard.top + 66), g_pal.textMuted, DWRITE_TEXT_ALIGNMENT_TRAILING);
 
@@ -1247,7 +1281,7 @@ static void RenderUI() {
   DrawSmoothChart(rt, cRect, g_app.downHistory, maxSpd, g_pal.chartLineMain);
 
   D2D1_RECT_F netCard = RF(contentX + col2W + gap, topY, contentX + contentW, topY + row1H);
-  DrawGlassCard(rt, br, netCard, L"Network Detection", L"IP");
+  DrawGlassCard(rt, br, netCard, L"Public Endpoint", L"IP");
   g_app.rcEyeBtn = RF(netCard.right - 126, netCard.top + 10, netCard.right - 72, netCard.top + 32);
   g_app.rcRefreshIpBtn = RF(netCard.right - 66, netCard.top + 10, netCard.right - 12, netCard.top + 32);
   FillRR(rt, br, g_app.rcEyeBtn, 6.0f, PtInRectF(g_app.mouseX, g_app.mouseY, g_app.rcEyeBtn) ? g_pal.pillBg : g_pal.cardInnerBg);
@@ -1279,10 +1313,13 @@ static void RenderUI() {
   DrawGlassCard(rt, br, prxCard, prxHeader, L"\u21C4");
 
   if (vProxies.empty()) {
+   g_app.proxyCardScrollY = 0.0f;
    DrawTxt(rt, br, g_app.tfSecValue, checking ? L"Scanning Local Ports..." : L"No Local Proxy Active", RF(prxCard.left + 16, prxCard.top + 48, prxCard.right - 16, prxCard.top + 76), g_pal.textMuted);
    DrawTxt(rt, br, g_app.tfTiny, L"IPv6: Unavailable", RF(prxCard.left + 16, prxCard.top + 80, prxCard.right - 16, prxCard.top + 98), g_pal.textMuted);
    DrawTxt(rt, br, g_app.tfSmall, L"Auto-detects any unknown SOCKS5 / HTTP port", RF(prxCard.left + 16, prxCard.top + 124, prxCard.right - 16, prxCard.top + 148), g_pal.textMuted);
   } else {
+   float maxPrxScroll = (vProxies.size() <= 1) ? 0.0f : (std::max)(0.0f, (float)vProxies.size() * 60.0f - 110.0f);
+   if (g_app.proxyCardScrollY > maxPrxScroll) g_app.proxyCardScrollY = maxPrxScroll;
    D2D1_RECT_F clipR = RF(prxCard.left + 10, prxCard.top + 38, prxCard.right - 10, prxCard.bottom - 8);
    rt->PushAxisAlignedClip(clipR, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
    float py = clipR.top - g_app.proxyCardScrollY;
@@ -1335,7 +1372,7 @@ static void RenderUI() {
 
   float row3Y = row2Y + row2H + gap, row3H = (std::max)(122.0f, H - row3Y - 18.0f), col4W = (contentW - gap * 3.0f) / 4.0f;
 
-  DrawCompactStatCard(rt, br, RF(contentX, row3Y, contentX + col4W, row3Y + row3H), L"TUN", L"T",
+  DrawCompactStatCard(rt, br, RF(contentX, row3Y, contentX + col4W, row3Y + row3H), L"Virtual TUN", L"T",
    g_app.tunActive ? L"Enabled" : L"Disabled", g_app.tunActive ? g_pal.accentGreen : g_pal.textMuted,
    g_app.tunActive ? (L"IF: " + g_app.tunAdapterName) : L"IF: None", g_app.tunActive ? g_app.tunAdapterIp : L"Inactive");
 
@@ -1355,15 +1392,15 @@ static void RenderUI() {
    pMain, vProxies.empty() ? g_pal.textMuted : g_pal.textWhite, pMid, g_app.sysProxyEnabled ? (L"Sys: " + g_app.sysProxyServer) : L"SysProxy: Off");
 
   float c3X = contentX + (col4W + gap) * 2;
-  DrawCompactStatCard(rt, br, RF(c3X, row3Y, c3X + col4W, row3Y + row3H), L"Traffic Usage", L"\u2261",
+  DrawCompactStatCard(rt, br, RF(c3X, row3Y, c3X + col4W, row3Y + row3H), L"Session Traffic", L"\u2261",
    L"\u2193 " + FormatBytes((double)g_app.sessionInBytes, false), g_pal.textWhite,
    L"\u2191 " + FormatBytes((double)g_app.sessionOutBytes, false), L"Total: " + FormatBytes((double)g_app.totalSysInBytes, false));
 
   float c4X = contentX + (col4W + gap) * 3;
-  DrawCompactStatCard(rt, br, RF(c4X, row3Y, contentX + contentW, row3Y + row3H), L"Intranet IP", L"L",
+  DrawCompactStatCard(rt, br, RF(c4X, row3Y, contentX + contentW, row3Y + row3H), L"Local Network", L"L",
    g_app.primaryAdapter.ipv4, g_pal.textWhite, g_app.primaryAdapter.ipv6, L"GW: " + g_app.primaryAdapter.gateway);
 
-} else if (g_app.currentTab == 1) {
+ } else if (g_app.currentTab == 1) {
   const wchar_t* filters[] = { L"Live Event Log (Time)", L"Active Sockets", L"Proxied / TUN Log", L"Verified Ports" };
   float fx = contentX;
   for (int i = 0; i < 4; i++) {
@@ -1537,7 +1574,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
   if (g_app.currentTab == 0 && PtInRectF(g_app.mouseX, g_app.mouseY, g_app.rcProxyCardArea)) {
    g_app.proxyCardScrollY -= (delta / 120.0f) * 30.0f;
    if (g_app.proxyCardScrollY < 0.0f) g_app.proxyCardScrollY = 0.0f;
-   float maxS = (std::max)(0.0f, (float)g_app.verifiedProxies.size() * 60.0f - 110.0f);
+   float maxS = (g_app.verifiedProxies.size() <= 1) ? 0.0f : (std::max)(0.0f, (float)g_app.verifiedProxies.size() * 60.0f - 110.0f);
    if (g_app.proxyCardScrollY > maxS) g_app.proxyCardScrollY = maxS;
    InvalidateRect(hwnd, nullptr, FALSE);
   } else if (g_app.currentTab == 0 && PtInRectF(g_app.mouseX, g_app.mouseY, g_app.rcFlowsPreviewCard)) {
