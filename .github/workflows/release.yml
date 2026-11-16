@@ -1,0 +1,70 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Optional: Enter tag name (e.g. v1.1.0) to publish a Release, or leave empty for test build'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build x64 Native Binary (MSVC)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC x64 Developer Environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Compile ip.cpp
+        shell: pwsh
+        run: |
+          if (Test-Path "app.rc") {
+            rc /nologo app.rc
+            cl /nologo /O2 /MT /EHsc /utf-8 /W4 ip.cpp app.res /Fe:ip.exe /link /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF
+          } elseif (Test-Path "app.ico") {
+            '101 ICON "app.ico"' | Out-File -Encoding ascii app.rc
+            rc /nologo app.rc
+            cl /nologo /O2 /MT /EHsc /utf-8 /W4 ip.cpp app.res /Fe:ip.exe /link /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF
+          } else {
+            cl /nologo /O2 /MT /EHsc /utf-8 /W4 ip.cpp /Fe:ip.exe /link /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF
+          }
+
+          if (!(Test-Path "ip.exe")) {
+            Write-Error "Compilation failed: ip.exe was not generated."
+            exit 1
+          }
+
+          $hash = (Get-FileHash -Path "ip.exe" -Algorithm SHA256).Hash.ToLower()
+          "$hash  ip.exe" | Out-File -Encoding ascii ip.exe.sha256
+          Write-Host "Build succeeded! SHA256: $hash"
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Network-x64-Windows
+          path: |
+            ip.exe
+            ip.exe.sha256
+
+      - name: Publish to GitHub Releases
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.tag_name != '')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag_name || github.ref_name }}
+          files: |
+            ip.exe
+            ip.exe.sha256
+          generate_release_notes: false
