@@ -1,5 +1,9 @@
 # Network — Native Windows Telemetry & Route Inspector
-[![DOI](https://zenodo.org/badge/1454653664.svg)](https://doi.org/10.5281/zenodo.24295637)
+![Language](https://img.shields.io/badge/Language-C%2B%2B17-blue.svg)
+![Platform](https://img.shields.io/badge/Platform-Win32%20x64-0078D6.svg)
+![Dependencies](https://img.shields.io/badge/Dependencies-Zero-brightgreen.svg)
+![Rendering](https://img.shields.io/badge/UI-Direct2D%20%2B%20DWM-purple.svg)
+![DOI](https://zenodo.org/badge/1454653664.svg)](https://doi.org/10.5281/zenodo.24295637)
 <img width="1040" height="660" alt="Screenshot 2026-11-17 072645" src="https://github.com/user-attachments/assets/a9955beb-6774-438d-9558-3e98af3b7e5e" />
 
 **Network** (`ip.cpp`) is a single-file, zero-dependency, hardware-accelerated network telemetry and route inspection utility for Windows 10 and Windows 11. Written in pure C++ using native Win32, Direct2D, DirectWrite, IP Helper (`iphlpapi`), and SSPI/Schannel APIs, it compiles into a standalone executable of **~150 KB** with a minimal memory footprint and zero external runtime requirements.
